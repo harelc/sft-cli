@@ -12,7 +12,7 @@ from textual.binding import Binding
 from textual.containers import Container, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Input, Label, Static, Tree
+from textual.widgets import Button, DataTable, Footer, Input, Label, Static, Tree
 from textual.widgets.tree import TreeNode
 
 from sft.index import (
@@ -942,18 +942,22 @@ class KohyaConvertScreen(ModalScreen):
         height: auto;
         dock: bottom;
     }
+
+    #kohya-convert-btn {
+        margin-top: 1;
+        width: 100%;
+    }
     """
 
     BINDINGS = [
         Binding("escape", "dismiss", "Cancel"),
-        Binding("enter", "run_convert", "Convert", priority=True),
     ]
 
     def __init__(self, file_path: Path, index: TensorIndex) -> None:
         super().__init__()
         self.file_path = file_path
         self.index = index
-        self._running = False
+        self._converting = False
 
     def compose(self) -> ComposeResult:
         from sft.data import detect_kohya_format
@@ -987,6 +991,8 @@ class KohyaConvertScreen(ModalScreen):
                 )
             yield Static(msg, id="kohya-info")
             yield Static("", id="kohya-status")
+            if n_kohya > 0:
+                yield Button("Convert", id="kohya-convert-btn", variant="warning")
             help_msg = (
                 "[dim]Enter: convert  |  ESC: cancel[/dim]"
                 if n_kohya > 0
@@ -994,16 +1000,23 @@ class KohyaConvertScreen(ModalScreen):
             )
             yield Static(help_msg, id="kohya-help")
 
-    def action_run_convert(self) -> None:
-        if self._running or self._n_kohya == 0:
-            return
-        self._running = True
-        self.query_one("#kohya-status", Static).update(
-            "[yellow]Converting...[/yellow]"
-        )
-        self.run_worker(self._do_convert, thread=True)
+    def on_mount(self) -> None:
+        if self._n_kohya > 0:
+            self.query_one("#kohya-convert-btn", Button).focus()
 
-    def _do_convert(self) -> None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "kohya-convert-btn":
+            self.action_run_convert()
+
+    def action_run_convert(self) -> None:
+        if self._converting or self._n_kohya == 0:
+            return
+        self._converting = True
+        status = self.query_one("#kohya-status", Static)
+        status.update("[yellow]Converting...[/yellow]")
+        btn = self.query_one("#kohya-convert-btn", Button)
+        btn.disabled = True
+
         import traceback
 
         from sft.data import convert_kohya_to_peft
@@ -1019,20 +1032,15 @@ class KohyaConvertScreen(ModalScreen):
                 f"{n_pass} passthrough tensors\n"
                 f"Output size: {format_bytes(new_size)}[/green]"
             )
-            self.app.call_from_thread(
-                self.query_one("#kohya-status", Static).update, summary,
+            status.update(summary)
+            self.app.notify(
+                f"Saved {self._out_path.name} ({n_kohya} modules converted)"
             )
-            self.app.call_from_thread(
-                self.app.notify,
-                f"Saved {self._out_path.name} ({n_kohya} modules converted)",
-            )
-        except Exception:
-            self.app.call_from_thread(
-                self.query_one("#kohya-status", Static).update,
-                f"[red]{traceback.format_exc()}[/red]",
-            )
+        except Exception as e:
+            status.update(f"[red]{traceback.format_exc()}[/red]")
+            self.app.notify(f"Conversion failed: {e}", severity="error")
         finally:
-            self._running = False
+            self._converting = False
 
 
 class LoraScreen(ModalScreen):
