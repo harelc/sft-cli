@@ -287,6 +287,155 @@ def load_all_tensors(
     return result
 
 
+_KOHYA_SUFFIXES = (
+    ".lora_down.weight", ".lora_up.weight", ".alpha",
+    ".lora_A.weight", ".lora_B.weight",
+)
+
+
+def _group_lora_modules(
+    tensor_names: list[str],
+) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Group tensor names by LoRA prefix.
+
+    Returns (modules, passthrough) where modules maps prefix -> {suffix: full_name}
+    and passthrough is the list of names that didn't match any LoRA suffix.
+    """
+    modules: dict[str, dict[str, str]] = {}
+    passthrough: list[str] = []
+    for k in tensor_names:
+        for s in _KOHYA_SUFFIXES:
+            if k.endswith(s):
+                prefix = k[: -len(s)]
+                modules.setdefault(prefix, {})[s] = k
+                break
+        else:
+            passthrough.append(k)
+    return modules, passthrough
+
+
+def detect_kohya_format(
+    tensor_names: list[str],
+) -> tuple[int, int, int]:
+    """Detect Kohya/PEFT LoRA modules in a list of tensor names.
+
+    Returns (n_kohya_modules, n_peft_modules, n_passthrough) where:
+      - n_kohya_modules: prefixes with at least one of lora_down/lora_up
+      - n_peft_modules:  prefixes with lora_A/lora_B (no Kohya keys)
+      - n_passthrough:   tensors not matching any LoRA suffix
+    """
+    modules, passthrough = _group_lora_modules(tensor_names)
+    n_kohya = n_peft = 0
+    for parts in modules.values():
+        has_kohya = ".lora_down.weight" in parts or ".lora_up.weight" in parts
+        has_peft = ".lora_A.weight" in parts or ".lora_B.weight" in parts
+        if has_kohya:
+            n_kohya += 1
+        elif has_peft:
+            n_peft += 1
+    return n_kohya, n_peft, len(passthrough)
+
+
+def _read_raw(file_path: Path, header_size: int, info) -> np.ndarray:
+    """Read a tensor's raw bytes as its storage numpy dtype (no BF16 conversion)."""
+    np_dtype, _ = _DTYPE_MAP[info.dtype]
+    data_start = 8 + header_size + info.data_offsets[0]
+    nbytes = info.data_offsets[1] - info.data_offsets[0]
+    with open(file_path, "rb") as f:
+        f.seek(data_start)
+        raw = f.read(nbytes)
+    return np.frombuffer(raw, dtype=np_dtype).copy().reshape(info.shape)
+
+
+def convert_kohya_to_peft(
+    file_path: Path,
+    index: TensorIndex,
+    out_path: Path,
+) -> tuple[int, int, int]:
+    """Convert a Kohya/sd-scripts LoRA file to PEFT/diffusers naming.
+
+    Kohya:  <prefix>.lora_down.weight, <prefix>.lora_up.weight, <prefix>.alpha
+    PEFT:   <prefix>.lora_A.weight   = lora_down
+            <prefix>.lora_B.weight   = lora_up * (alpha / rank)
+
+    Returns (n_kohya_converted, n_peft_kept, n_passthrough).
+    """
+    tensor_names = [t.full_name for t in index.tensors]
+    modules, passthrough = _group_lora_modules(tensor_names)
+    tensor_map = {t.full_name: t for t in index.tensors}
+
+    out: dict[str, tuple[np.ndarray, str]] = {}
+    out_order: list[str] = []
+    n_kohya = n_peft = 0
+
+    for prefix, parts in modules.items():
+        has_kohya = ".lora_down.weight" in parts or ".lora_up.weight" in parts
+        has_peft = ".lora_A.weight" in parts or ".lora_B.weight" in parts
+
+        if has_peft and not has_kohya:
+            for s in (".lora_A.weight", ".lora_B.weight"):
+                if s in parts:
+                    name = parts[s]
+                    info = tensor_map[name]
+                    out[name] = (_read_raw(file_path, index.header_size, info), info.dtype)
+                    out_order.append(name)
+            n_peft += 1
+            continue
+
+        if not has_kohya:
+            continue
+
+        down_k = parts.get(".lora_down.weight")
+        up_k = parts.get(".lora_up.weight")
+        if down_k is None or up_k is None:
+            continue
+
+        down_info = tensor_map[down_k]
+        up_info = tensor_map[up_k]
+
+        down_arr = _read_raw(file_path, index.header_size, down_info)
+        rank = down_info.shape[0]
+
+        if ".alpha" in parts:
+            alpha_info = tensor_map[parts[".alpha"]]
+            alpha_arr = load_tensor(
+                file_path, index.header_size, alpha_info.data_offsets,
+                alpha_info.dtype, alpha_info.shape,
+            )
+            alpha = float(np.asarray(alpha_arr).flatten()[0])
+        else:
+            alpha = float(rank)
+
+        scale = alpha / rank
+        if scale != 1.0:
+            up_float = load_tensor(
+                file_path, index.header_size, up_info.data_offsets,
+                up_info.dtype, up_info.shape,
+            ).astype(np.float32) * scale
+            up_arr = _cast_to_dtype(up_float, up_info.dtype)
+        else:
+            up_arr = _read_raw(file_path, index.header_size, up_info)
+
+        a_name = f"{prefix}.lora_A.weight"
+        b_name = f"{prefix}.lora_B.weight"
+        out[a_name] = (down_arr, down_info.dtype)
+        out[b_name] = (up_arr, up_info.dtype)
+        out_order.extend([a_name, b_name])
+        n_kohya += 1
+
+    for name in passthrough:
+        info = tensor_map[name]
+        out[name] = (_read_raw(file_path, index.header_size, info), info.dtype)
+        out_order.append(name)
+
+    new_meta = dict(index.metadata) if index.metadata else {}
+    new_meta["converted_from"] = "kohya_lora_to_peft"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    write_safetensors(out_path, out, out_order, new_meta)
+    return n_kohya, n_peft, len(passthrough)
+
+
 def write_safetensors(
     path: Path,
     tensors: dict[str, tuple[np.ndarray, str]],
