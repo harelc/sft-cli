@@ -906,6 +906,135 @@ class CompactifyScreen(ModalScreen):
             )
 
 
+class KohyaConvertScreen(ModalScreen):
+    """Modal screen to convert a Kohya-format LoRA file to PEFT naming."""
+
+    CSS = """
+    KohyaConvertScreen {
+        align: center middle;
+    }
+
+    #kohya-box {
+        width: 70;
+        height: auto;
+        background: $surface;
+        border: thick $warning;
+        padding: 1 2;
+    }
+
+    #kohya-title {
+        text-align: center;
+        text-style: bold;
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #kohya-info {
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #kohya-status {
+        height: auto;
+    }
+
+    #kohya-help {
+        height: auto;
+        dock: bottom;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Cancel"),
+        Binding("enter", "run_convert", "Convert", priority=True),
+    ]
+
+    def __init__(self, file_path: Path, index: TensorIndex) -> None:
+        super().__init__()
+        self.file_path = file_path
+        self.index = index
+        self._running = False
+
+    def compose(self) -> ComposeResult:
+        from sft.data import detect_kohya_format
+
+        names = [t.full_name for t in self.index.tensors]
+        n_kohya, n_peft, n_pass = detect_kohya_format(names)
+        self._n_kohya = n_kohya
+        self._n_peft = n_peft
+        self._n_pass = n_pass
+        out_path = self.file_path.parent / f"{self.file_path.stem}_peft.safetensors"
+        self._out_path = out_path
+
+        with Container(id="kohya-box"):
+            yield Label("Convert Kohya → PEFT", id="kohya-title")
+            if n_kohya == 0:
+                msg = (
+                    "[yellow]No Kohya-format modules detected.[/yellow]\n"
+                    f"  PEFT modules:   {n_peft}\n"
+                    f"  Passthrough:    {n_pass}\n"
+                    "\n[dim]Nothing to convert.[/dim]"
+                )
+            else:
+                msg = (
+                    f"  [bold]Kohya modules:[/bold]   {n_kohya}  "
+                    "[dim](will be renamed + scaled by alpha/rank)[/dim]\n"
+                    f"  [bold]PEFT modules:[/bold]    {n_peft}  "
+                    "[dim](kept as-is)[/dim]\n"
+                    f"  [bold]Passthrough:[/bold]     {n_pass}  "
+                    "[dim](non-LoRA tensors)[/dim]\n"
+                    f"\n  [bold]Output:[/bold] {out_path.name}"
+                )
+            yield Static(msg, id="kohya-info")
+            yield Static("", id="kohya-status")
+            help_msg = (
+                "[dim]Enter: convert  |  ESC: cancel[/dim]"
+                if n_kohya > 0
+                else "[dim]ESC: close[/dim]"
+            )
+            yield Static(help_msg, id="kohya-help")
+
+    def action_run_convert(self) -> None:
+        if self._running or self._n_kohya == 0:
+            return
+        self._running = True
+        self.query_one("#kohya-status", Static).update(
+            "[yellow]Converting...[/yellow]"
+        )
+        self.run_worker(self._do_convert, thread=True)
+
+    def _do_convert(self) -> None:
+        import traceback
+
+        from sft.data import convert_kohya_to_peft
+
+        try:
+            n_kohya, n_peft, n_pass = convert_kohya_to_peft(
+                self.file_path, self.index, self._out_path,
+            )
+            new_size = self._out_path.stat().st_size
+            summary = (
+                f"[green]Saved {self._out_path.name}\n"
+                f"Converted {n_kohya} Kohya modules, kept {n_peft} PEFT modules, "
+                f"{n_pass} passthrough tensors\n"
+                f"Output size: {format_bytes(new_size)}[/green]"
+            )
+            self.app.call_from_thread(
+                self.query_one("#kohya-status", Static).update, summary,
+            )
+            self.app.call_from_thread(
+                self.app.notify,
+                f"Saved {self._out_path.name} ({n_kohya} modules converted)",
+            )
+        except Exception:
+            self.app.call_from_thread(
+                self.query_one("#kohya-status", Static).update,
+                f"[red]{traceback.format_exc()}[/red]",
+            )
+        finally:
+            self._running = False
+
+
 class LoraScreen(ModalScreen):
     """Modal screen showing LoRA pair analysis with a DataTable."""
 
@@ -1592,6 +1721,7 @@ class SftApp(App):
         Binding("space", "show_details", "Details", show=True),
         Binding("m", "show_metadata", "Metadata", show=True),
         Binding("l", "show_lora", "LoRA", show=True),
+        Binding("k", "convert_kohya", "Kohya→PEFT", show=True),
         Binding("g", "goto_top", "Top", show=False),
         Binding("G", "goto_bottom", "Bottom", show=False),
     ]
@@ -1841,6 +1971,12 @@ class SftApp(App):
                     self._lora_stats_cache,
                 )
             )
+
+    def action_convert_kohya(self) -> None:
+        """Open the Kohya → PEFT conversion dialog."""
+        if self.index is None:
+            return
+        self.push_screen(KohyaConvertScreen(self.file_path, self.index))
 
     def action_show_filters(self) -> None:
         """Show filter palette."""
