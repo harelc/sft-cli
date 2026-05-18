@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import struct
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-from sft.index import TensorIndex
+from sft.index import TensorIndex, natural_sort_key
 from sft.lora import LoraPair
 
 # Dtype string -> (numpy dtype, bytes per element)
@@ -481,3 +482,134 @@ def write_safetensors(
         for name in tensor_order:
             arr, _ = tensors[name]
             f.write(arr.tobytes())
+
+
+@dataclass
+class TensorDiff:
+    """Per-tensor comparison result between two safetensors files."""
+
+    name: str
+    status: str  # "equal", "close", "differ", "incompatible", "left_only", "right_only"
+    shape_a: tuple[int, ...] | None = None
+    shape_b: tuple[int, ...] | None = None
+    dtype_a: str | None = None
+    dtype_b: str | None = None
+    numel: int = 0
+    max_abs: float = 0.0
+    mean_abs: float = 0.0
+    rel_l2: float = 0.0
+    cosine: float = 1.0
+
+
+@dataclass
+class DiffResult:
+    """Aggregate result of comparing two safetensors files."""
+
+    file_a: Path
+    file_b: Path
+    rtol: float
+    atol: float
+    entries: list[TensorDiff] = field(default_factory=list)
+
+    def by_status(self, status: str) -> list[TensorDiff]:
+        return [e for e in self.entries if e.status == status]
+
+
+def _load_as_float64(
+    file_path: Path,
+    header_size: int,
+    info,
+) -> np.ndarray:
+    """Load a tensor and cast to float64 for stable diff math."""
+    arr = load_tensor(
+        file_path, header_size, info.data_offsets, info.dtype, info.shape,
+    )
+    if arr.dtype.kind in ("u", "i"):
+        return arr.astype(np.float64)
+    return arr.astype(np.float64)
+
+
+def diff_safetensors(
+    file_a: Path,
+    file_b: Path,
+    rtol: float = 1e-5,
+    atol: float = 1e-8,
+) -> DiffResult:
+    """Compare two .safetensors files tensor-by-tensor.
+
+    For each common key with matching shape, computes max-abs-diff,
+    mean-abs-diff, relative L2 (||a-b|| / ||a||), and cosine similarity.
+    Categorizes each tensor as one of:
+      - left_only / right_only: key present in only one file
+      - incompatible: shape mismatch on a common key
+      - equal: bitwise-equal values (max_abs == 0)
+      - close: within rtol/atol per np.allclose
+      - differ: outside tolerances
+    """
+    idx_a = TensorIndex.from_file(file_a)
+    idx_b = TensorIndex.from_file(file_b)
+    map_a = {t.full_name: t for t in idx_a.tensors}
+    map_b = {t.full_name: t for t in idx_b.tensors}
+    keys_a, keys_b = set(map_a), set(map_b)
+
+    result = DiffResult(file_a=file_a, file_b=file_b, rtol=rtol, atol=atol)
+
+    for k in sorted(keys_a - keys_b, key=natural_sort_key):
+        t = map_a[k]
+        result.entries.append(
+            TensorDiff(
+                name=k, status="left_only",
+                shape_a=t.shape, dtype_a=t.dtype, numel=t.numel,
+            )
+        )
+    for k in sorted(keys_b - keys_a, key=natural_sort_key):
+        t = map_b[k]
+        result.entries.append(
+            TensorDiff(
+                name=k, status="right_only",
+                shape_b=t.shape, dtype_b=t.dtype, numel=t.numel,
+            )
+        )
+
+    for k in sorted(keys_a & keys_b, key=natural_sort_key):
+        ta, tb = map_a[k], map_b[k]
+        d = TensorDiff(
+            name=k, status="differ",
+            shape_a=ta.shape, shape_b=tb.shape,
+            dtype_a=ta.dtype, dtype_b=tb.dtype,
+            numel=ta.numel,
+        )
+        if ta.shape != tb.shape:
+            d.status = "incompatible"
+            result.entries.append(d)
+            continue
+
+        a = _load_as_float64(file_a, idx_a.header_size, ta)
+        b = _load_as_float64(file_b, idx_b.header_size, tb)
+
+        diff = a - b
+        abs_diff = np.abs(diff)
+        d.max_abs = float(abs_diff.max()) if abs_diff.size else 0.0
+        d.mean_abs = float(abs_diff.mean()) if abs_diff.size else 0.0
+
+        norm_a = float(np.linalg.norm(a))
+        norm_b = float(np.linalg.norm(b))
+        diff_norm = float(np.linalg.norm(diff))
+        d.rel_l2 = diff_norm / norm_a if norm_a > 0 else (0.0 if diff_norm == 0 else float("inf"))
+        if norm_a > 0 and norm_b > 0:
+            d.cosine = float(np.dot(a.ravel(), b.ravel()) / (norm_a * norm_b))
+        elif norm_a == 0 and norm_b == 0:
+            d.cosine = 1.0
+        else:
+            d.cosine = 0.0
+
+        if d.max_abs == 0.0:
+            d.status = "equal"
+        elif np.allclose(a, b, rtol=rtol, atol=atol):
+            d.status = "close"
+        else:
+            d.status = "differ"
+
+        result.entries.append(d)
+
+    return result
