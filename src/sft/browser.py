@@ -1043,6 +1043,211 @@ class KohyaConvertScreen(ModalScreen):
             self._converting = False
 
 
+class DiffPromptScreen(ModalScreen[Path]):
+    """Prompt the user for a second file path to diff against."""
+
+    CSS = """
+    DiffPromptScreen { align: center middle; }
+    #diff-prompt-box {
+        width: 90;
+        height: auto;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #diff-prompt-title {
+        text-align: center; text-style: bold;
+        height: auto; margin-bottom: 1;
+    }
+    #diff-prompt-help { height: auto; margin-top: 1; }
+    """
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, current_file: Path) -> None:
+        super().__init__()
+        self.current_file = current_file
+
+    def compose(self) -> ComposeResult:
+        with Container(id="diff-prompt-box"):
+            yield Label("Compare against …", id="diff-prompt-title")
+            yield Static(f"A: {self.current_file}", id="diff-prompt-a")
+            yield Input(
+                placeholder="Path to second .safetensors file",
+                id="diff-prompt-input",
+            )
+            yield Static("[dim]Enter: open diff  |  ESC: cancel[/dim]", id="diff-prompt-help")
+
+    def on_mount(self) -> None:
+        self.query_one("#diff-prompt-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        raw = event.value.strip()
+        if not raw:
+            return
+        path = Path(raw).expanduser()
+        if not path.exists() or not path.is_file():
+            self.query_one("#diff-prompt-help", Static).update(
+                f"[red]File not found: {path}[/red]"
+            )
+            return
+        self.dismiss(path)
+
+
+class DiffScreen(ModalScreen):
+    """Modal showing tensor-by-tensor diff results in a DataTable."""
+
+    CSS = """
+    DiffScreen {
+        layout: vertical;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #diff-title { text-align: center; text-style: bold; height: auto; margin-bottom: 1; }
+    #diff-info  { height: auto; margin-bottom: 1; }
+    #diff-table { height: 1fr; }
+    #diff-help  { height: auto; dock: bottom; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+        Binding("a", "show_all", "All", show=True),
+        Binding("d", "show_differ", "Differ", show=True),
+        Binding("e", "show_equal", "Equal", show=True),
+        Binding("m", "show_missing", "Missing", show=True),
+        Binding("i", "show_incompatible", "Incompatible", show=True),
+    ]
+
+    _STATUS_STYLES = {
+        "equal": "green",
+        "close": "cyan",
+        "differ": "red",
+        "incompatible": "magenta",
+        "left_only": "yellow",
+        "right_only": "yellow",
+    }
+
+    def __init__(self, file_a: Path, file_b: Path) -> None:
+        super().__init__()
+        self.file_a = file_a
+        self.file_b = file_b
+        self._result = None
+        self._filter = "differ"  # default view
+
+    def compose(self) -> ComposeResult:
+        yield Label("Tensor Diff", id="diff-title")
+        yield Static(
+            f"[bold]A:[/bold] {self.file_a.name}\n"
+            f"[bold]B:[/bold] {self.file_b.name}\n"
+            "[dim]Computing diff... this may take a moment.[/dim]",
+            id="diff-info",
+        )
+        yield DataTable(id="diff-table", zebra_stripes=True)
+        yield Static(
+            "[dim]a:all  d:differ  e:equal  m:missing  i:incompatible  ESC:close[/dim]",
+            id="diff-help",
+        )
+
+    def on_mount(self) -> None:
+        table = self.query_one("#diff-table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns(
+            "status", "name", "shape", "max_abs", "mean_abs", "rel_L2", "cos",
+        )
+        self.run_worker(self._compute_diff, thread=True, exclusive=True)
+
+    def _compute_diff(self) -> None:
+        import traceback
+
+        from sft.data import diff_safetensors
+        try:
+            result = diff_safetensors(self.file_a, self.file_b)
+        except Exception:
+            self.app.call_from_thread(
+                self.query_one("#diff-info", Static).update,
+                f"[red]{traceback.format_exc()}[/red]",
+            )
+            return
+        self._result = result
+        self.app.call_from_thread(self._refresh_view)
+
+    def _refresh_view(self) -> None:
+        from collections import Counter
+
+        if self._result is None:
+            return
+        counts = Counter(e.status for e in self._result.entries)
+        summary_parts = []
+        for s in ("equal", "close", "differ", "incompatible", "left_only", "right_only"):
+            n = counts.get(s, 0)
+            if n:
+                style = self._STATUS_STYLES.get(s, "white")
+                summary_parts.append(f"[{style}]{s}:{n}[/{style}]")
+        self.query_one("#diff-info", Static).update(
+            f"[bold]A:[/bold] {self.file_a.name}    "
+            f"[bold]B:[/bold] {self.file_b.name}\n"
+            + "  ".join(summary_parts)
+        )
+        self._populate_table()
+
+    def _populate_table(self) -> None:
+        if self._result is None:
+            return
+        table = self.query_one("#diff-table", DataTable)
+        table.clear()
+        for e in self._result.entries:
+            if self._filter == "all":
+                pass
+            elif self._filter == "differ" and e.status not in ("differ", "incompatible"):
+                continue
+            elif self._filter == "equal" and e.status not in ("equal", "close"):
+                continue
+            elif self._filter == "missing" and e.status not in ("left_only", "right_only"):
+                continue
+            elif self._filter == "incompatible" and e.status != "incompatible":
+                continue
+            if e.shape_a == e.shape_b:
+                shape = str(e.shape_a) if e.shape_a else str(e.shape_b)
+            elif e.shape_a and e.shape_b:
+                shape = f"{e.shape_a}!={e.shape_b}"
+            else:
+                shape = str(e.shape_a or e.shape_b)
+            if e.status in ("equal", "close", "differ"):
+                max_abs = f"{e.max_abs:.3e}"
+                mean_abs = f"{e.mean_abs:.3e}"
+                rel_l2 = f"{e.rel_l2:.3e}"
+                cos = f"{e.cosine:.4f}"
+            else:
+                max_abs = mean_abs = rel_l2 = cos = "-"
+            style = self._STATUS_STYLES.get(e.status, "white")
+            table.add_row(
+                f"[{style}]{e.status}[/{style}]",
+                e.name, shape, max_abs, mean_abs, rel_l2, cos,
+            )
+
+    def action_show_all(self) -> None:
+        self._filter = "all"
+        self._populate_table()
+
+    def action_show_differ(self) -> None:
+        self._filter = "differ"
+        self._populate_table()
+
+    def action_show_equal(self) -> None:
+        self._filter = "equal"
+        self._populate_table()
+
+    def action_show_missing(self) -> None:
+        self._filter = "missing"
+        self._populate_table()
+
+    def action_show_incompatible(self) -> None:
+        self._filter = "incompatible"
+        self._populate_table()
+
+
 class LoraScreen(ModalScreen):
     """Modal screen showing LoRA pair analysis with a DataTable."""
 
@@ -1730,6 +1935,7 @@ class SftApp(App):
         Binding("m", "show_metadata", "Metadata", show=True),
         Binding("l", "show_lora", "LoRA", show=True),
         Binding("k", "convert_kohya", "Kohya→PEFT", show=True),
+        Binding("D", "diff_file", "Diff", show=True),
         Binding("g", "goto_top", "Top", show=False),
         Binding("G", "goto_bottom", "Bottom", show=False),
     ]
@@ -1985,6 +2191,18 @@ class SftApp(App):
         if self.index is None:
             return
         self.push_screen(KohyaConvertScreen(self.file_path, self.index))
+
+    def action_diff_file(self) -> None:
+        """Prompt for a second file and open the diff screen."""
+        if self.index is None:
+            return
+
+        def on_path(result: Path | None) -> None:
+            if result is None:
+                return
+            self.push_screen(DiffScreen(self.file_path, result))
+
+        self.push_screen(DiffPromptScreen(self.file_path), on_path)
 
     def action_show_filters(self) -> None:
         """Show filter palette."""
