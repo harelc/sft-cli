@@ -31,10 +31,11 @@ pip install sft-cli
 ## Usage
 
 ```bash
-sft model.safetensors
+sft model.safetensors          # interactive browser
+sft diff a.safetensors b.safetensors   # tensor-by-tensor comparison
 ```
 
-That's it. Navigate with arrow keys, search with `/`, quit with `q`.
+Navigate with arrow keys, search with `/`, quit with `q`.
 
 ## Features
 
@@ -63,6 +64,18 @@ That's it. Navigate with arrow keys, search with `/`, quit with `q`.
 - **Energy tracking** — Shows fraction of Frobenius energy retained per pair
 - **Output** — Saves a new `.safetensors` file (e.g., `model_r8.safetensors` or `model_rauto.safetensors`)
 
+### Kohya → PEFT Conversion (`k`)
+- **Auto-detect** — Identifies Kohya-format LoRA modules (`lora_down`/`lora_up`/`alpha`)
+- **Rename + scale** — Renames to PEFT convention (`lora_A`/`lora_B`) and bakes `alpha/rank` scaling into B, so downstream loaders can drop the `.alpha` tensor
+- **Pass-through** — Non-LoRA tensors and already-PEFT modules are copied as-is
+- **Output** — Saves `<name>_peft.safetensors` with a `converted_from: kohya_lora_to_peft` metadata marker
+
+### Diff (`D` or `sft diff`)
+- **Tensor-by-tensor compare** — Categorizes each key as `equal`, `close`, `differ`, `incompatible` (shape mismatch), `left_only`, or `right_only`
+- **Numeric metrics** — For comparable tensors: max-abs-diff, mean-abs-diff, relative L2 (`||a−b||/||a||`), and cosine similarity
+- **TUI filters** — In the browser, press `D` to open a diff; toggle views with `a` (all) / `d` (differ) / `e` (equal) / `m` (missing) / `i` (incompatible)
+- **CLI mode** — `sft diff a b [--rtol 1e-5] [--atol 1e-8] [--show diff|all|missing|incompatible] [--limit 50]`
+
 ## Keybindings
 
 ### Main Browser
@@ -78,6 +91,8 @@ That's it. Navigate with arrow keys, search with `/`, quit with `q`.
 | `m` | File metadata |
 | `f` | Filter by dtype |
 | `l` | LoRA analysis |
+| `k` | Kohya → PEFT convert |
+| `D` | Diff against another file |
 | `q` | Quit |
 
 ### LoRA Analysis
@@ -102,6 +117,13 @@ For LoRA analysis, computing the SVD of B@A directly would require forming the f
 
 ### Compactification
 Rank reduction works by computing the SVD of each LoRA pair's effective matrix B@A, truncating to the top-k singular values, and reconstructing new smaller A' and B' matrices with √σ split equally between them. This is the optimal rank-k approximation (Eckart–Young theorem).
+
+### Diff Metrics
+For each common-key, same-shape tensor pair the diff reports:
+- `max_abs` — `max |a − b|`, the worst-case elementwise drift
+- `mean_abs` — average elementwise drift
+- `rel_L2` — `||a − b|| / ||a||`, magnitude of the difference relative to A
+- `cos` — cosine similarity; values near 1.0 with non-zero `rel_L2` indicate a pure scale change
 
 ## License
 
