@@ -14,18 +14,31 @@ If you work with ML models, you've probably found yourself wondering "what's act
 
 ## Installation
 
-The recommended way to install is via [uv](https://docs.astral.sh/uv/):
+This fork is not published to PyPI — install directly from the GitHub repo.
+
+With [uv](https://docs.astral.sh/uv/) (recommended):
 
 ```bash
-uv tool install sft-cli
+uv tool install git+https://github.com/harelc/sft-cli
 ```
 
 This makes `sft` available globally as a command.
 
-Or install with pip:
+Or with pip:
 
 ```bash
-pip install sft-cli
+pip install git+https://github.com/harelc/sft-cli
+```
+
+To install a specific branch or tag, append `@<ref>` to the URL (e.g. `…/sft-cli@main`).
+
+For local development:
+
+```bash
+git clone https://github.com/harelc/sft-cli
+cd sft-cli
+uv sync
+uv run sft --help
 ```
 
 ## Usage
