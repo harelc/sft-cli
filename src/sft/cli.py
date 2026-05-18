@@ -140,10 +140,52 @@ def diff_cmd(
         typer.echo(f"... ({len(listing) - limit} more — use --limit to see more)")
 
 
+@app.command("merge")
+def merge_cmd(
+    file_a: Path = typer.Argument(..., exists=True, dir_okay=False, resolve_path=True),
+    file_b: Path = typer.Argument(..., exists=True, dir_okay=False, resolve_path=True),
+    coeff_a: float = typer.Option(1.0, "-a", "--coeff-a", help="Coefficient for file A."),
+    coeff_b: float = typer.Option(1.0, "-b", "--coeff-b", help="Coefficient for file B."),
+    output: Path = typer.Option(..., "-o", "--output", help="Output .safetensors path."),
+    target_rank: Optional[int] = typer.Option(
+        None, "--target-rank", "-r",
+        help="If set, SVD-compactify merged pairs to this rank. Default: lossless (r_A + r_B).",
+    ),
+) -> None:
+    """Merge two PEFT LoRAs: C_eff = coeff_a · A_lora + coeff_b · B_lora."""
+    from sft.data import merge_loras
+
+    report = merge_loras(
+        file_a, coeff_a, file_b, coeff_b, output, target_rank=target_rank,
+    )
+    typer.echo(f"Wrote {output}")
+    typer.echo(f"  modules in both:   {report.n_both}")
+    typer.echo(f"  only in A (×{coeff_a:g}): {report.n_a_only}")
+    typer.echo(f"  only in B (×{coeff_b:g}): {report.n_b_only}")
+    if report.n_skipped_kohya:
+        typer.secho(
+            f"  skipped (kohya, run `sft browse … k` first): {report.n_skipped_kohya}",
+            fg=typer.colors.YELLOW,
+        )
+    if report.n_skipped_shape:
+        typer.secho(
+            f"  skipped (incompatible in/out shapes): {report.n_skipped_shape}",
+            fg=typer.colors.YELLOW,
+        )
+    typer.echo(f"  passthrough tensors (from A): {report.n_passthrough}")
+    if target_rank is not None:
+        typer.echo(f"  truncated to rank: {target_rank}")
+    else:
+        typer.echo("  rank: lossless (r_A + r_B per module)")
+
+
 def _entry() -> None:
     """Entry point with backward-compat: `sft <file>` opens the browser."""
     argv = sys.argv[1:]
-    known = {"browse", "diff", "--help", "-h", "--install-completion", "--show-completion"}
+    known = {
+        "browse", "diff", "merge",
+        "--help", "-h", "--install-completion", "--show-completion",
+    }
     if argv and argv[0] not in known and not argv[0].startswith("-"):
         # Backward compat: `sft file.safetensors` → `sft browse file.safetensors`
         sys.argv.insert(1, "browse")
