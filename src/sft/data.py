@@ -613,3 +613,158 @@ def diff_safetensors(
         result.entries.append(d)
 
     return result
+
+
+@dataclass
+class MergeReport:
+    """Summary of a two-LoRA merge."""
+
+    n_both: int = 0
+    n_a_only: int = 0
+    n_b_only: int = 0
+    n_skipped_kohya: int = 0
+    n_skipped_shape: int = 0
+    n_passthrough: int = 0
+    truncated_rank: int | None = None  # None if lossless concat
+
+
+def _peft_pair(parts: dict[str, str]) -> tuple[str, str] | None:
+    """Return (down_name, up_name) if module is in PEFT form, else None."""
+    if ".lora_A.weight" in parts and ".lora_B.weight" in parts:
+        return parts[".lora_A.weight"], parts[".lora_B.weight"]
+    return None
+
+
+def _is_kohya(parts: dict[str, str]) -> bool:
+    return ".lora_down.weight" in parts or ".lora_up.weight" in parts
+
+
+def merge_loras(
+    file_a: Path,
+    coeff_a: float,
+    file_b: Path,
+    coeff_b: float,
+    out_path: Path,
+    target_rank: int | None = None,
+) -> MergeReport:
+    """Merge two PEFT-format LoRAs: C_eff = coeff_a · (B_A @ A_A) + coeff_b · (B_B @ A_B).
+
+    Per module, stacks low-rank factors:
+        out_down (lora_A) = vstack([coeff_a · A_A,  coeff_b · A_B])
+        out_up   (lora_B) = hstack([B_A, B_B])
+    so out_up @ out_down reproduces the weighted sum exactly. Merged rank is
+    r_A + r_B; pass `target_rank` to SVD-compactify after the merge.
+
+    Modules present in only one file are kept and scaled by that file's
+    coefficient. Kohya-format modules are skipped (run kohya→peft first).
+    Non-LoRA tensors pass through from file A.
+    """
+    idx_a = TensorIndex.from_file(file_a)
+    idx_b = TensorIndex.from_file(file_b)
+    tmap_a = {t.full_name: t for t in idx_a.tensors}
+    tmap_b = {t.full_name: t for t in idx_b.tensors}
+
+    modules_a, passthrough_a = _group_lora_modules([t.full_name for t in idx_a.tensors])
+    modules_b, _ = _group_lora_modules([t.full_name for t in idx_b.tensors])
+
+    out: dict[str, tuple[np.ndarray, str]] = {}
+    out_order: list[str] = []
+    report = MergeReport(truncated_rank=target_rank)
+
+    prefixes = sorted(set(modules_a) | set(modules_b), key=natural_sort_key)
+
+    for prefix in prefixes:
+        parts_a = modules_a.get(prefix, {})
+        parts_b = modules_b.get(prefix, {})
+
+        if _is_kohya(parts_a) or _is_kohya(parts_b):
+            report.n_skipped_kohya += 1
+            continue
+
+        peft_a = _peft_pair(parts_a)
+        peft_b = _peft_pair(parts_b)
+
+        if peft_a and peft_b:
+            down_a_info = tmap_a[peft_a[0]]
+            up_a_info   = tmap_a[peft_a[1]]
+            down_b_info = tmap_b[peft_b[0]]
+            up_b_info   = tmap_b[peft_b[1]]
+
+            in_shape_a  = tuple(down_a_info.shape[1:])
+            in_shape_b  = tuple(down_b_info.shape[1:])
+            out_shape_a = tuple(up_a_info.shape[:1] + up_a_info.shape[2:])
+            out_shape_b = tuple(up_b_info.shape[:1] + up_b_info.shape[2:])
+            if in_shape_a != in_shape_b or out_shape_a != out_shape_b:
+                report.n_skipped_shape += 1
+                continue
+
+            a_dtype = down_a_info.dtype
+            b_dtype = up_a_info.dtype
+
+            down_a = load_tensor(file_a, idx_a.header_size, down_a_info.data_offsets, down_a_info.dtype, down_a_info.shape).astype(np.float32)
+            up_a   = load_tensor(file_a, idx_a.header_size, up_a_info.data_offsets,   up_a_info.dtype,   up_a_info.shape).astype(np.float32)
+            down_b = load_tensor(file_b, idx_b.header_size, down_b_info.data_offsets, down_b_info.dtype, down_b_info.shape).astype(np.float32)
+            up_b   = load_tensor(file_b, idx_b.header_size, up_b_info.data_offsets,   up_b_info.dtype,   up_b_info.shape).astype(np.float32)
+
+            merged_down = np.concatenate([coeff_a * down_a, coeff_b * down_b], axis=0)
+            merged_up   = np.concatenate([up_a, up_b], axis=1)
+
+            if target_rank is not None and target_rank < merged_down.shape[0]:
+                merged_down, merged_up, _ = truncate_lora_pair(
+                    merged_down, merged_up, target_rank, a_dtype,
+                )
+
+            report.n_both += 1
+        elif peft_a:
+            down_a_info = tmap_a[peft_a[0]]
+            up_a_info   = tmap_a[peft_a[1]]
+            a_dtype = down_a_info.dtype
+            b_dtype = up_a_info.dtype
+            down_a = load_tensor(file_a, idx_a.header_size, down_a_info.data_offsets, down_a_info.dtype, down_a_info.shape).astype(np.float32)
+            up_a   = load_tensor(file_a, idx_a.header_size, up_a_info.data_offsets,   up_a_info.dtype,   up_a_info.shape).astype(np.float32)
+            merged_down = coeff_a * down_a
+            merged_up   = up_a
+            if target_rank is not None and target_rank < merged_down.shape[0]:
+                merged_down, merged_up, _ = truncate_lora_pair(
+                    merged_down, merged_up, target_rank, a_dtype,
+                )
+            report.n_a_only += 1
+        elif peft_b:
+            down_b_info = tmap_b[peft_b[0]]
+            up_b_info   = tmap_b[peft_b[1]]
+            a_dtype = down_b_info.dtype
+            b_dtype = up_b_info.dtype
+            down_b = load_tensor(file_b, idx_b.header_size, down_b_info.data_offsets, down_b_info.dtype, down_b_info.shape).astype(np.float32)
+            up_b   = load_tensor(file_b, idx_b.header_size, up_b_info.data_offsets,   up_b_info.dtype,   up_b_info.shape).astype(np.float32)
+            merged_down = coeff_b * down_b
+            merged_up   = up_b
+            if target_rank is not None and target_rank < merged_down.shape[0]:
+                merged_down, merged_up, _ = truncate_lora_pair(
+                    merged_down, merged_up, target_rank, a_dtype,
+                )
+            report.n_b_only += 1
+        else:
+            continue
+
+        a_name = f"{prefix}.lora_A.weight"
+        b_name = f"{prefix}.lora_B.weight"
+        out[a_name] = (_cast_to_dtype(merged_down, a_dtype), a_dtype)
+        out[b_name] = (_cast_to_dtype(merged_up,   b_dtype), b_dtype)
+        out_order.extend([a_name, b_name])
+
+    for name in passthrough_a:
+        info = tmap_a[name]
+        out[name] = (_read_raw(file_a, idx_a.header_size, info), info.dtype)
+        out_order.append(name)
+        report.n_passthrough += 1
+
+    new_meta = dict(idx_a.metadata) if idx_a.metadata else {}
+    new_meta["merged_from"] = json.dumps({
+        "file_a": str(file_a), "coeff_a": coeff_a,
+        "file_b": str(file_b), "coeff_b": coeff_b,
+        "target_rank": target_rank,
+    })
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    write_safetensors(out_path, out, out_order, new_meta)
+    return report

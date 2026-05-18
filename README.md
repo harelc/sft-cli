@@ -44,8 +44,9 @@ uv run sft --help
 ## Usage
 
 ```bash
-sft model.safetensors          # interactive browser
-sft diff a.safetensors b.safetensors   # tensor-by-tensor comparison
+sft model.safetensors                                              # interactive browser
+sft diff a.safetensors b.safetensors                               # tensor-by-tensor comparison
+sft merge a.safetensors b.safetensors -a 0.7 -b 0.3 -o out.safetensors   # weighted LoRA merge
 ```
 
 Navigate with arrow keys, search with `/`, quit with `q`.
@@ -82,6 +83,14 @@ Navigate with arrow keys, search with `/`, quit with `q`.
 - **Rename + scale** — Renames to PEFT convention (`lora_A`/`lora_B`) and bakes `alpha/rank` scaling into B, so downstream loaders can drop the `.alpha` tensor
 - **Pass-through** — Non-LoRA tensors and already-PEFT modules are copied as-is
 - **Output** — Saves `<name>_peft.safetensors` with a `converted_from: kohya_lora_to_peft` metadata marker
+
+### Weighted LoRA Merge (`sft merge`)
+- **Weighted sum** — `C_eff = α · A_eff + β · B_eff` per module, where `_eff = lora_B @ lora_A`
+- **Rank-aware** — Stacks the two adapters' factors (merged rank = `r_A + r_B`), so no compression is required before adding; ranks don't need to match
+- **Optional truncation** — `--target-rank N` runs SVD on the merged pair to compress back to rank `N` (uses the same compactify tooling)
+- **Per-side modules** — Modules present in only one file are kept and scaled by that file's coefficient
+- **PEFT-form only** — Run the `k` converter on Kohya files first; Kohya modules are reported and skipped
+- **CLI** — `sft merge A.safetensors B.safetensors -a 0.7 -b 0.3 -o out.safetensors [--target-rank N]`
 
 ### Diff (`D` or `sft diff`)
 - **Tensor-by-tensor compare** — Categorizes each key as `equal`, `close`, `differ`, `incompatible` (shape mismatch), `left_only`, or `right_only`
